@@ -1,6 +1,6 @@
 'use strict';
 
-const { Clutter, GLib } = imports.gi;
+const { Clutter, Gio, GLib } = imports.gi;
 
 const EndSessionDialog = imports.ui.endSessionDialog.EndSessionDialog;
 const Main = imports.ui.main;
@@ -11,6 +11,62 @@ const Extension = ExtensionUtils.getCurrentExtension();
 const { Preferences } = Extension.imports.lib.preferences;
 const { _ } = Extension.imports.lib.utils;
 
+const LoginManagerProxy = Gio.DBusProxy.makeProxyWrapper(`
+    <node>
+        <interface name="org.freedesktop.login1.Manager">
+            <method name="Hibernate">
+                <arg type="b" direction="in"/>
+            </method>
+            <method name="CanHibernate">
+                <arg type="s" direction="out"/>
+            </method>
+        </interface>
+    </node>
+`);
+
+class LoginManager {
+    constructor() {
+        this._proxy = new LoginManagerProxy(
+            Gio.DBus.system,
+            `org.freedesktop.login1`,
+            `/org/freedesktop/login1`,
+            (...[, error]) => {
+                if (error) {
+                    this._logError(error);
+                } else {
+                    this._proxy.CanHibernateRemote((result, error) => {
+                        if (error) {
+                            this._logError(error);
+                        } else {
+                            this._canHibernate = [`yes`, `challenge`].includes(result[0]);
+                        }
+                    });
+                }
+            }
+        );
+    }
+
+    get canHibernate() {
+        return this._canHibernate ?? false;
+    }
+
+    hibernate() {
+        if (!this.canHibernate) {
+            return;
+        }
+
+        this._proxy.HibernateRemote(true, (...[, error]) => {
+            if (error) {
+                this._logError(error);
+            }
+        });
+    }
+
+    _logError(error) {
+        console.error(`${Extension.uuid}:`, error);
+    }
+}
+
 class ExtensionImpl {
     static {
         ExtensionUtils.initTranslations(Extension.uuid);
@@ -18,6 +74,16 @@ class ExtensionImpl {
 
     enable() {
         this._preferences = new Preferences();
+        if (this._preferences.showHibernateButton) {
+            this._loginManager = new LoginManager();
+        } else {
+            this._preferences.connectObject(`notify::showHibernateButton`, () => {
+                if (this._preferences.showHibernateButton) {
+                    this._preferences.disconnectObject(this);
+                    this._loginManager = new LoginManager();
+                }
+            }, this);
+        }
 
         const extension = this;
 
@@ -40,6 +106,19 @@ class ExtensionImpl {
                 key: Clutter.KEY_Escape,
                 action: this.cancel.bind(this),
             });
+
+            if (extension._preferences.showHibernateButton && extension._loginManager.canHibernate && systemActions.canSuspend) {
+                addButton({
+                    label: _(`Hibernate`, `button`),
+                    action: () => {
+                        const signalId = this.connect(`closed`, () => {
+                            this.disconnect(signalId);
+                            extension._loginManager.hibernate();
+                        });
+                        this.cancel();
+                    },
+                });
+            }
 
             if (extension._preferences.showSuspendButton && systemActions.canSuspend) {
                 addButton({
@@ -114,6 +193,9 @@ class ExtensionImpl {
         EndSessionDialog.prototype._updateButtons = this._originUpdateButtonsFunc;
         delete this._originUpdateButtonsFunc;
 
+        delete this._loginManager;
+
+        this._preferences.disconnectObject(this);
         this._preferences.destroy();
         delete this._preferences;
     }
